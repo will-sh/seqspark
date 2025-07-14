@@ -36,6 +36,24 @@ except ImportError:
     print("错误：需要安装PySpark。请运行：pip install pyspark", file=sys.stderr)
     sys.exit(1)
 
+def record_to_dict(record):
+    """将SequenceRecord转换为字典的独立函数"""
+    return {
+        'id': record.id,
+        'name': record.name,
+        'sequence': record.sequence,
+        'quality': record.quality,
+        'line_number': record.line_number,
+        'is_fastq': record.is_fastq
+    }
+
+def format_sequence(row):
+    """格式化序列输出的独立函数"""
+    if row.is_fastq:
+        return f"@{row.name}\n{row.sequence}\n+\n{row.quality or ''}"
+    else:
+        return f">{row.name}\n{row.sequence}"
+
 @dataclass
 class SequenceRecord:
     """序列记录数据结构"""
@@ -46,16 +64,7 @@ class SequenceRecord:
     line_number: int = 0
     is_fastq: bool = False
     
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典格式"""
-        return {
-            'id': self.id,
-            'name': self.name,
-            'sequence': self.sequence,
-            'quality': self.quality,
-            'line_number': self.line_number,
-            'is_fastq': self.is_fastq
-        }
+
     
     def format_output(self) -> str:
         """格式化输出"""
@@ -98,7 +107,8 @@ class SeqSparkSample:
         else:
             return open
     
-    def parse_fasta_partition(self, lines: Iterator[str]) -> Iterator[SequenceRecord]:
+    @staticmethod
+    def parse_fasta_partition(lines: Iterator[str]) -> Iterator[SequenceRecord]:
         """解析FASTA格式的分区"""
         current_header = None
         current_id = None
@@ -139,7 +149,8 @@ class SeqSparkSample:
                 is_fastq=False
             )
     
-    def parse_fastq_partition(self, lines: Iterator[str]) -> Iterator[SequenceRecord]:
+    @staticmethod
+    def parse_fastq_partition(lines: Iterator[str]) -> Iterator[SequenceRecord]:
         """解析FASTQ格式的分区"""
         line_array = list(lines)
         i = 0
@@ -184,9 +195,9 @@ class SeqSparkSample:
         
         # 解析序列
         if format_type == 'fastq':
-            sequences_rdd = text_rdd.mapPartitions(self.parse_fastq_partition)
+            sequences_rdd = text_rdd.mapPartitions(SeqSparkSample.parse_fastq_partition)
         else:
-            sequences_rdd = text_rdd.mapPartitions(self.parse_fasta_partition)
+            sequences_rdd = text_rdd.mapPartitions(SeqSparkSample.parse_fasta_partition)
         
         # 转换为DataFrame
         schema = StructType([
@@ -198,7 +209,7 @@ class SeqSparkSample:
             StructField("is_fastq", BooleanType(), True)
         ])
         
-        df = self.spark.createDataFrame(sequences_rdd.map(lambda x: x.to_dict()), schema)
+        df = self.spark.createDataFrame(sequences_rdd.map(record_to_dict), schema)
         return df
     
     def sample_by_number(self, sequences_df: DataFrame, number: int, seed: int = 11) -> DataFrame:
@@ -228,12 +239,6 @@ class SeqSparkSample:
     def write_sequences(self, sequences_df: DataFrame, output_path: str):
         """写入序列到文件"""
         # 格式化输出
-        def format_sequence(row):
-            if row.is_fastq:
-                return f"@{row.name}\n{row.sequence}\n+\n{row.quality or ''}"
-            else:
-                return f">{row.name}\n{row.sequence}"
-        
         formatted_rdd = sequences_df.rdd.map(format_sequence)
         
         if output_path == '-':
