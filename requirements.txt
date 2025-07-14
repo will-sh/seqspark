@@ -1,0 +1,20 @@
+# PySpark 和相关依赖
+pyspark>=3.5.0
+py4j>=0.10.9
+
+# 数据处理
+pandas>=1.5.0
+numpy>=1.21.0
+
+# 命令行参数解析
+argparse
+
+# 类型提示支持
+typing_extensions>=4.0.0
+
+# 可选：用于更好的性能
+pyarrow>=10.0.0
+
+# 开发和测试依赖
+pytest>=7.0.0
+pytest-cov>=4.0.0 
