@@ -229,8 +229,20 @@ def write_sequences(sequences_df, output_path: str):
         for result in results:
             print(result)
     else:
-        # 输出到文件
-        formatted_rdd.coalesce(1).saveAsTextFile(output_path)
+        # 收集所有结果到driver
+        results = formatted_rdd.collect()
+        
+        # 检查是否需要压缩输出
+        if output_path.endswith('.gz'):
+            # 输出为gzip压缩文件
+            with gzip.open(output_path, 'wt') as f:
+                for result in results:
+                    f.write(result + '\n')
+        else:
+            # 输出为普通文本文件
+            with open(output_path, 'w') as f:
+                for result in results:
+                    f.write(result + '\n')
 
 def run_sampling(spark, input_file: str, output_file: str, number: int = 0, 
                 proportion: float = 0.0, seed: int = 11, format_type: str = 'auto',
@@ -282,25 +294,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
-  # 按数量采样
-  python seqspark_sample.py -i large.fastq.gz -n 10000 -o sampled.fastq
+  # 按数量采样（输出压缩格式）
+  python seqspark_sample.py -i large.fastq.gz -n 10000 -o sampled.fastq.gz
   
-  # 按比例采样
-  python seqspark_sample.py -i large.fastq.gz -p 0.1 -o sampled.fastq
+  # 按比例采样（输出压缩格式）
+  python seqspark_sample.py -i large.fastq.gz -p 0.1 -o sampled.fastq.gz
   
   # 指定随机种子
-  python seqspark_sample.py -i large.fastq.gz -n 5000 -s 42 -o sampled.fastq
+  python seqspark_sample.py -i large.fastq.gz -n 5000 -s 42 -o sampled.fastq.gz
   
   # 在集群上运行
   python seqspark_sample.py -i hdfs://path/to/large.fastq.gz -n 100000 \\
-    --master spark://master:7077 --memory 8g
+    --master spark://master:7077 --memory 8g -o sampled.fastq.gz
         """
     )
     
     parser.add_argument('-i', '--input', required=True,
                        help='输入FASTA/FASTQ文件路径（支持.gz, .bz2, .xz压缩）')
     parser.add_argument('-o', '--output', default='-',
-                       help='输出文件路径（默认：标准输出）')
+                       help='输出文件路径（默认：标准输出）。支持.gz压缩格式')
     parser.add_argument('-n', '--number', type=int, default=0,
                        help='按数量采样')
     parser.add_argument('-p', '--proportion', type=float, default=0.0,
