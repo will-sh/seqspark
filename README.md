@@ -23,9 +23,40 @@
 ## 环境要求
 
 - Python 3.7+
-- Apache Spark 3.0+
-- Java 8+
+- Apache Spark 3.3+
+- Java 8+ (推荐Java 17)
 - 可选：Hadoop (用于HDFS支持)
+
+### ⚠️ 重要：Java版本兼容性
+
+如果你遇到Java版本兼容性错误，如：
+```
+java.lang.UnsupportedClassVersionError: org/apache/spark/launcher/Main has been compiled by a more recent version of the Java Runtime
+```
+
+这说明你的Java版本过低。有以下解决方案：
+
+**方案1：升级Java版本（推荐）**
+```bash
+# CentOS/RHEL
+sudo yum install java-17-openjdk java-17-openjdk-devel
+
+# Ubuntu/Debian
+sudo apt-get install openjdk-17-jdk
+
+# 设置环境变量
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+export PATH=$JAVA_HOME/bin:$PATH
+```
+
+**方案2：使用Spark 3.3.2版本**
+当前的requirements.txt已配置为使用Spark 3.3.2版本。
+
+**方案3：使用自动化设置脚本**
+```bash
+chmod +x setup_java.sh
+./setup_java.sh
+```
 
 ## 安装
 
@@ -50,9 +81,9 @@ conda install pyspark pandas numpy pyarrow
 
 ```bash
 # 下载并安装Spark
-wget https://archive.apache.org/dist/spark/spark-3.5.0/spark-3.5.0-bin-hadoop3.tgz
-tar -xzf spark-3.5.0-bin-hadoop3.tgz
-export SPARK_HOME=/path/to/spark-3.5.0-bin-hadoop3
+wget https://archive.apache.org/dist/spark/spark-3.3.2/spark-3.3.2-bin-hadoop3.tgz
+tar -xzf spark-3.3.2-bin-hadoop3.tgz
+export SPARK_HOME=/path/to/spark-3.3.2-bin-hadoop3
 export PATH=$PATH:$SPARK_HOME/bin
 ```
 
@@ -182,25 +213,97 @@ python seqspark_sample.py -i huge.fastq.gz -n 100000 -o sampled.fastq.gz \
 
 ## 故障排除
 
-### 1. 内存不足错误
+### 1. Java版本兼容性问题
+
+**错误信息：**
+```
+java.lang.UnsupportedClassVersionError: org/apache/spark/launcher/Main has been compiled by a more recent version of the Java Runtime (class file version 61.0), this version of the Java Runtime only recognizes class file versions up to 52.0
+```
+
+**解决方法：**
+1. **升级Java版本（推荐）**：
+   ```bash
+   # 检查当前Java版本
+   java -version
+   
+   # CentOS/RHEL 安装Java 17
+   sudo yum install java-17-openjdk java-17-openjdk-devel
+   
+   # Ubuntu/Debian 安装Java 17
+   sudo apt-get install openjdk-17-jdk
+   
+   # 设置环境变量
+   export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+   export PATH=$JAVA_HOME/bin:$PATH
+   
+   # 添加到 ~/.bashrc
+   echo 'export JAVA_HOME=/usr/lib/jvm/java-17-openjdk' >> ~/.bashrc
+   echo 'export PATH=$JAVA_HOME/bin:$PATH' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+2. **使用Spark 3.3.2版本**：
+   ```bash
+   # 卸载当前PySpark
+   pip uninstall pyspark
+   
+   # 安装Spark 3.3.2版本
+   pip install -r requirements.txt
+   ```
+
+3. **使用设置脚本**：
+   ```bash
+   chmod +x setup_java.sh
+   ./setup_java.sh
+   ```
+
+### 2. 内存不足错误
 
 ```bash
 # 增加driver和executor内存
 ./run_python.sh -d 8g -e 6g -- -i large.fastq.gz -n 10000 -o sampled.fastq.gz
 ```
 
-### 2. 文件格式错误
+### 3. 文件格式错误
 
 ```bash
 # 手动指定格式
 python seqspark_sample.py -i file.txt -f fastq -n 1000 -o sampled.fastq.gz
 ```
 
-### 3. 依赖问题
+### 4. 依赖问题
 
 ```bash
 # 重新安装依赖
 ./run_python.sh -i -- -i large.fastq.gz -n 1000 -o sampled.fastq.gz
+```
+
+### 5. Spark启动失败
+
+**错误信息：**
+```
+[JAVA_GATEWAY_EXITED] Java gateway process exited before sending its port number.
+```
+
+**解决方法：**
+1. 检查Java版本是否兼容
+2. 确保Java环境变量正确设置
+3. 检查防火墙是否阻止Spark端口
+4. 增加Spark启动超时时间：
+   ```bash
+   export SPARK_SUBMIT_OPTS="-Dspark.launcher.childConectionTimeout=60000"
+   ```
+
+### 6. 权限问题
+
+```bash
+# 确保脚本有执行权限
+chmod +x run_python.sh
+chmod +x setup_java.sh
+
+# 确保输出目录有写权限
+mkdir -p /path/to/output
+chmod 755 /path/to/output
 ```
 
 ## 测试

@@ -1,6 +1,6 @@
 # PySpark 和相关依赖
-pyspark>=3.5.0
-py4j>=0.10.9
+pyspark>=3.3.2,<3.4.0
+py4j>=0.10.9.5
 
 # 数据处理
 pandas>=1.5.0
