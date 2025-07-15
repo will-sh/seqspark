@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-SeqSpark Minimal - 极简高性能FASTQ采样工具
+SeqSpark Minimal - Enhanced with YARN Error Handling
 
 专注于：
 1. 最高性能的RDD处理
 2. 最大化并行性
 3. 最少的内存使用
-4. 仅支持未压缩FASTQ文件
+4. 修复YARN cluster模式输出问题
 """
 
 import argparse
 import sys
+import os
 from pyspark.sql import SparkSession
 
 def parse_fastq_partition(lines):
@@ -39,12 +40,50 @@ def format_fastq_record(record):
     header, sequence, quality = record
     return f"@{header}\n{sequence}\n+\n{quality}"
 
+def safe_output_write(spark_context, output_rdd, output_path, overwrite=False):
+    """安全的输出写入，处理YARN集群模式的常见问题"""
+    try:
+        # 检查是否是HDFS路径
+        is_hdfs = output_path.startswith(('hdfs://', '/'))
+        
+        if is_hdfs:
+            # HDFS路径处理
+            hadoop_conf = spark_context._jsc.hadoopConfiguration()
+            fs = spark_context._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+            output_path_obj = spark_context._jvm.org.apache.hadoop.fs.Path(output_path)
+            
+            # 检查输出目录是否存在
+            if fs.exists(output_path_obj):
+                if overwrite:
+                    print(f"输出目录已存在，正在删除: {output_path}")
+                    fs.delete(output_path_obj, True)  # True表示递归删除
+                else:
+                    raise Exception(f"输出目录已存在: {output_path}. 使用 --overwrite 强制覆盖")
+        
+        # 对于大型集群，避免使用coalesce(1)以防止内存问题
+        # 使用适当的分区数
+        num_partitions = max(1, min(output_rdd.getNumPartitions(), 10))
+        output_rdd_partitioned = output_rdd.coalesce(num_partitions)
+        
+        # 执行保存操作
+        output_rdd_partitioned.saveAsTextFile(output_path)
+        print(f"成功保存到: {output_path}")
+        
+    except Exception as e:
+        print(f"保存失败: {str(e)}")
+        print("可能的解决方案:")
+        print("1. 检查输出路径权限")
+        print("2. 确保输出目录不存在，或使用 --overwrite")
+        print("3. 检查HDFS连接")
+        raise e
+
 def main():
-    parser = argparse.ArgumentParser(description="SeqSpark Minimal - 极简高性能FASTQ采样")
+    parser = argparse.ArgumentParser(description="SeqSpark Minimal Enhanced - 修复YARN问题")
     parser.add_argument('-i', '--input', required=True, help='输入FASTQ文件')
     parser.add_argument('-o', '--output', default='-', help='输出文件')
     parser.add_argument('-p', '--proportion', type=float, required=True, help='采样比例 (0.0-1.0)')
     parser.add_argument('-s', '--seed', type=int, default=11, help='随机种子')
+    parser.add_argument('--overwrite', action='store_true', help='覆盖现有输出目录')
     parser.add_argument('--master', default='local[*]', help='Spark master')
     parser.add_argument('--memory', default='4g', help='内存配置')
     
@@ -57,43 +96,51 @@ def main():
     
     # 创建Spark会话 - 最优配置
     spark = SparkSession.builder \
-        .appName("SeqSpark-Minimal") \
+        .appName("SeqSpark-Enhanced") \
         .master(args.master) \
         .config("spark.driver.memory", args.memory) \
         .config("spark.executor.memory", args.memory) \
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
         .config("spark.sql.files.maxPartitionBytes", "134217728") \
+        .config("spark.sql.adaptive.enabled", "true") \
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
         .getOrCreate()
     
     spark.sparkContext.setLogLevel("WARN")
     
     try:
-        print(f"SeqSpark Minimal - 处理文件: {args.input}")
+        print(f"SeqSpark Enhanced - 处理文件: {args.input}")
         print(f"采样比例: {args.proportion}")
+        print(f"输出路径: {args.output}")
         
-        # 1. 读取文件为RDD - 让Spark自动分区以获得最大并行性
+        # 1. 读取文件为RDD
         lines_rdd = spark.sparkContext.textFile(args.input)
+        print(f"输入分区数: {lines_rdd.getNumPartitions()}")
         
-        # 2. 解析FASTQ记录 - 使用mapPartitions提高效率
+        # 2. 解析FASTQ记录
         records_rdd = lines_rdd.mapPartitions(parse_fastq_partition)
         
-        # 3. 采样 - 直接使用RDD.sample，最高效的采样方法
+        # 3. 采样
         sampled_rdd = records_rdd.sample(False, args.proportion, args.seed)
         
         # 4. 格式化输出
         output_rdd = sampled_rdd.map(format_fastq_record)
         
-        # 5. 输出结果
+        # 5. 输出结果 - 使用安全的输出方法
         if args.output == '-':
             # 输出到标准输出
             results = output_rdd.collect()
             for result in results:
                 print(result)
         else:
-            # 保存到文件 - 使用coalesce减少输出文件数量
-            output_rdd.coalesce(1).saveAsTextFile(args.output)
+            # 使用增强的输出方法
+            safe_output_write(spark.sparkContext, output_rdd, args.output, args.overwrite)
             
-        print(f"采样完成！", file=sys.stderr)
+        print(f"采样完成！")
+        
+    except Exception as e:
+        print(f"任务失败: {str(e)}", file=sys.stderr)
+        sys.exit(1)
         
     finally:
         spark.stop()
