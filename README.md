@@ -108,6 +108,28 @@ python seqspark_sample.py -i large.fastq.gz -p 0.1 -o sampled.fastq.gz
 python seqspark_sample.py -i large.fastq.gz -n 5000 -s 42 -o sampled.fastq.gz
 ```
 
+### 优化版本（推荐用于大型压缩文件）
+
+对于大型压缩文件（如你的K562_100M_R1.fastq.gz），推荐使用优化版本：
+
+```bash
+# 使用优化版本处理大型压缩文件
+python seqspark_sample_optimized.py -i K562_100M_R1.fastq.gz -n 50000000 -s 100 -o output.fastq.gz
+
+# 指定分区数量和内存
+python seqspark_sample_optimized.py -i large.fastq.gz -n 10000000 -o sampled.fastq.gz --partitions 2000 --memory 32g
+
+# 使用自动化优化脚本
+./optimize_performance.sh -i K562_100M_R1.fastq.gz -n 50000000 -s 100 -o output.fastq.gz
+```
+
+**优化版本特性：**
+- 自动解决压缩文件单分区问题
+- 使用RDD重新分区技术
+- 智能分区数量计算
+- 支持Snappy压缩格式
+- 更好的性能监控
+
 ### 使用启动脚本
 
 ```bash
@@ -318,11 +340,16 @@ python test_sample.py
 
 ```
 seqspark/
-├── seqspark_sample.py       # Python版本主程序
-├── requirements.txt         # Python依赖
-├── run_python.sh           # Python版本启动脚本
-├── test_sample.py          # 测试脚本
-└── README.md               # 说明文档
+├── seqspark_sample.py          # Python版本主程序
+├── seqspark_sample_optimized.py # 优化版本（解决压缩文件性能问题）
+├── requirements.txt            # Python依赖
+├── run_python.sh              # Python版本启动脚本
+├── optimize_performance.sh    # 性能优化脚本
+├── setup_java.sh              # Java环境设置脚本
+├── test_sample.py             # 测试脚本
+├── README.md                  # 说明文档
+├── OPTIMIZATION_GUIDE.md      # 优化指南
+└── .gitignore                 # Git忽略文件
 ```
 
 ## 贡献
