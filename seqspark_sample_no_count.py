@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-SeqSpark - 高性能分布式生物序列采样工具（优化版）
+SeqSpark - 高性能分布式生物序列采样工具（无Count优化版）
 
-这个优化版本专门解决压缩文件单分区的性能问题：
-1. 对压缩文件使用RDD重新分区
-2. 支持临时保存为可分割格式
-3. 自动优化分区数量
-4. 提供更好的性能监控
-
-主要改进：
-- 使用RDD repartition解决压缩文件单分区问题
-- 支持Snappy压缩格式
-- 自动分区数量优化
-- 更好的内存管理
+主要优化：
+1. 去除不必要的count()操作
+2. 智能采样策略，不依赖总数统计
+3. 可选的快速估算模式
+4. 异步count选项
 """
 
 from __future__ import print_function
@@ -22,31 +16,19 @@ import os
 import gzip
 import bz2
 import lzma
-import tempfile
-import shutil
+import threading
+import time
 from typing import Iterator, Optional, List, Dict, Any
 from dataclasses import dataclass
 from pathlib import Path
-import time
 
 try:
     from pyspark.sql import SparkSession
     from pyspark.sql.functions import col, rand
     from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType
-    from pyspark.context import SparkContext
 except ImportError:
     print("错误：需要安装PySpark。请运行：pip install pyspark", file=sys.stderr)
     sys.exit(1)
-
-@dataclass
-class SequenceRecord:
-    """序列记录数据结构"""
-    id: str
-    name: str
-    sequence: str
-    quality: Optional[str] = None
-    line_number: int = 0
-    is_fastq: bool = False
 
 def record_to_dict(record):
     """将SequenceRecord转换为字典的独立函数"""
@@ -60,13 +42,28 @@ def record_to_dict(record):
     }
 
 def format_sequence(row):
-    """格式化序列输出"""
-    if row['is_fastq']:
-        # FASTQ格式
-        return f"@{row['name']}\n{row['sequence']}\n+\n{row['quality']}"
+    """格式化序列输出的独立函数"""
+    if row.is_fastq:
+        return f"@{row.name}\n{row.sequence}\n+\n{row.quality or ''}"
     else:
-        # FASTA格式
-        return f">{row['name']}\n{row['sequence']}"
+        return f">{row.name}\n{row.sequence}"
+
+@dataclass
+class SequenceRecord:
+    """序列记录数据结构"""
+    id: str
+    name: str
+    sequence: str
+    quality: Optional[str] = None
+    line_number: int = 0
+    is_fastq: bool = False
+    
+    def format_output(self) -> str:
+        """格式化输出"""
+        if self.is_fastq:
+            return f"@{self.name}\n{self.sequence}\n+\n{self.quality or ''}"
+        else:
+            return f">{self.name}\n{self.sequence}"
 
 def get_file_opener(file_path: str):
     """根据文件扩展名选择合适的文件打开器"""
@@ -82,7 +79,6 @@ def get_file_opener(file_path: str):
 def detect_format(file_path: str) -> str:
     """检测文件格式"""
     try:
-        # 读取前几行来检测格式
         opener = get_file_opener(file_path)
         with opener(file_path, 'rt') as f:
             lines = [f.readline().strip() for _ in range(10)]
@@ -95,70 +91,19 @@ def detect_format(file_path: str) -> str:
         print(f"警告：格式检测失败: {e}。默认使用FASTA格式。", file=sys.stderr)
         return 'fasta'
 
-def is_compressed_file(file_path: str) -> bool:
-    """检查文件是否被压缩"""
-    return file_path.endswith(('.gz', '.bz2', '.xz'))
-
-def estimate_partitions(file_path: str, target_partition_size_mb: int = 128) -> int:
-    """估算最适合的分区数量"""
+def estimate_sequence_count(file_path: str, format_type: str) -> int:
+    """快速估算序列数量（基于文件大小）"""
     try:
-        file_size_bytes = os.path.getsize(file_path)
-        file_size_mb = file_size_bytes / (1024 * 1024)
-        
-        # 对于压缩文件，估算解压后大小（通常为3-5倍）
-        if is_compressed_file(file_path):
-            file_size_mb *= 4
-        
-        # 计算分区数量
-        partitions = max(1, int(file_size_mb / target_partition_size_mb))
-        
-        # 限制分区数量在合理范围内
-        partitions = min(partitions, 10000)  # 最多10000个分区
-        partitions = max(partitions, 2)      # 至少2个分区
-        
-        return partitions
-    except Exception as e:
-        print(f"警告：无法估算分区数量: {e}。使用默认值。", file=sys.stderr)
-        return 200
-
-def preprocess_compressed_file(spark, file_path: str, temp_dir: str, target_partitions: int = None) -> str:
-    """预处理压缩文件，重新分区并保存为可分割格式"""
-    print(f"[优化] 检测到压缩文件，开始预处理...")
-    
-    # 估算分区数量
-    if target_partitions is None:
-        target_partitions = estimate_partitions(file_path)
-    
-    print(f"[优化] 目标分区数: {target_partitions}")
-    
-    # 创建临时目录
-    temp_output_dir = os.path.join(temp_dir, "repartitioned_data")
-    
-    start_time = time.time()
-    
-    # 读取压缩文件为RDD
-    print(f"[优化] 读取压缩文件...")
-    rdd = spark.sparkContext.textFile(file_path)
-    
-    # 重新分区
-    print(f"[优化] 重新分区到 {target_partitions} 个分区...")
-    repartitioned_rdd = rdd.repartition(target_partitions)
-    
-    # 保存为可分割格式（使用Snappy压缩）
-    print(f"[优化] 保存为可分割格式...")
-    try:
-        repartitioned_rdd.saveAsTextFile(
-            temp_output_dir,
-            compressionCodecClass="org.apache.hadoop.io.compress.SnappyCodec"
-        )
-    except Exception as e:
-        print(f"[优化] Snappy压缩失败，使用无压缩格式: {e}")
-        repartitioned_rdd.saveAsTextFile(temp_output_dir)
-    
-    elapsed_time = time.time() - start_time
-    print(f"[优化] 预处理完成，耗时: {elapsed_time:.2f}秒")
-    
-    return temp_output_dir
+        file_size = os.path.getsize(file_path)
+        if format_type == 'fastq':
+            # FASTQ: 平均每序列约300-400字节
+            estimated_count = file_size // 350
+        else:
+            # FASTA: 平均每序列约200字节
+            estimated_count = file_size // 200
+        return max(estimated_count, 1)
+    except:
+        return 1000000  # 默认估算值
 
 def parse_fasta_partition(lines: Iterator[str]) -> Iterator[SequenceRecord]:
     """解析FASTA格式的分区"""
@@ -172,7 +117,6 @@ def parse_fasta_partition(lines: Iterator[str]) -> Iterator[SequenceRecord]:
         line = line.strip()
         
         if line.startswith('>'):
-            # 保存之前的记录
             if current_header and current_id:
                 yield SequenceRecord(
                     id=current_id,
@@ -183,14 +127,12 @@ def parse_fasta_partition(lines: Iterator[str]) -> Iterator[SequenceRecord]:
                     is_fastq=False
                 )
             
-            # 开始新记录
             current_header = line[1:]
             current_id = current_header.split()[0]
             current_seq = []
         elif current_header:
             current_seq.append(line)
     
-    # 保存最后一个记录
     if current_header and current_id:
         yield SequenceRecord(
             id=current_id,
@@ -231,47 +173,18 @@ def parse_fastq_partition(lines: Iterator[str]) -> Iterator[SequenceRecord]:
         else:
             i += 1
 
-def read_sequences_optimized(spark, file_path: str, format_type: str = 'auto', 
-                           use_preprocessing: bool = True, temp_dir: str = None):
-    """优化版本的序列读取函数"""
-    # 检测格式
+def read_sequences(spark, file_path: str, format_type: str = 'auto'):
+    """读取序列文件"""
     if format_type == 'auto':
         format_type = detect_format(file_path)
     
-    # 检查是否需要预处理压缩文件
-    if use_preprocessing and is_compressed_file(file_path):
-        if temp_dir is None:
-            temp_dir = tempfile.mkdtemp(prefix="seqspark_")
-        
-        # 预处理压缩文件
-        processed_file_path = preprocess_compressed_file(spark, file_path, temp_dir)
-        
-        # 读取预处理后的文件
-        text_rdd = spark.sparkContext.textFile(processed_file_path)
-        
-        # 清理临时文件的函数
-        def cleanup_temp():
-            try:
-                shutil.rmtree(temp_dir)
-                print(f"[优化] 清理临时文件: {temp_dir}")
-            except Exception as e:
-                print(f"[优化] 清理临时文件失败: {e}")
-        
-        # 注册清理函数
-        import atexit
-        atexit.register(cleanup_temp)
-        
-    else:
-        # 直接读取文件
-        text_rdd = spark.sparkContext.textFile(file_path)
+    text_rdd = spark.sparkContext.textFile(file_path)
     
-    # 解析序列
     if format_type == 'fastq':
         sequences_rdd = text_rdd.mapPartitions(parse_fastq_partition)
     else:
         sequences_rdd = text_rdd.mapPartitions(parse_fasta_partition)
     
-    # 转换为DataFrame
     schema = StructType([
         StructField("id", StringType(), True),
         StructField("name", StringType(), True),
@@ -284,62 +197,70 @@ def read_sequences_optimized(spark, file_path: str, format_type: str = 'auto',
     df = spark.createDataFrame(sequences_rdd.map(record_to_dict), schema)
     return df
 
-def sample_by_number(sequences_df, number: int, seed: int = 11):
-    """按数量采样"""
-    total_count = sequences_df.count()
-    
-    if number >= total_count:
-        return sequences_df
-    
-    # 计算采样比例，加上1.1的安全系数
-    fraction = min(1.0, number / total_count * 1.1)
+def smart_sample_by_number(sequences_df, number: int, seed: int = 11, 
+                          estimated_total: Optional[int] = None):
+    """智能按数量采样（不依赖count）"""
+    if estimated_total:
+        # 使用估算值计算采样比例
+        if number >= estimated_total:
+            return sequences_df
+        
+        # 计算采样比例，加上安全系数
+        fraction = min(1.0, number / estimated_total * 1.2)
+    else:
+        # 如果没有估算值，使用保守的采样策略
+        # 假设需要采样的数量相对较小，使用较大的安全系数
+        fraction = min(1.0, number / 100000 * 2.0) if number < 100000 else 0.8
     
     # 进行采样
     sampled_df = sequences_df.sample(withReplacement=False, fraction=fraction, seed=seed)
     
-    # 如果采样结果超过需要的数量，进行精确限制
-    sampled_count = sampled_df.count()
-    if sampled_count > number:
-        sampled_df = sampled_df.orderBy(rand(seed)).limit(number)
+    # 如果采样过多，限制数量（这个count是对小数据集的，很快）
+    final_df = sampled_df.limit(number)
     
-    return sampled_df
+    return final_df
 
 def sample_by_proportion(sequences_df, proportion: float, seed: int = 11):
-    """按比例采样"""
+    """按比例采样（无需count）"""
     return sequences_df.sample(withReplacement=False, fraction=proportion, seed=seed)
+
+def async_count(sequences_df, result_container: List):
+    """异步执行count操作"""
+    try:
+        count = sequences_df.count()
+        result_container.append(count)
+    except Exception as e:
+        result_container.append(f"Count错误: {e}")
 
 def write_sequences(sequences_df, output_path: str):
     """写入序列到文件"""
-    # 格式化输出
     formatted_rdd = sequences_df.rdd.map(format_sequence)
     
     if output_path == '-':
-        # 输出到stdout
         results = formatted_rdd.collect()
         for result in results:
             print(result)
     else:
-        # 收集所有结果到driver
         results = formatted_rdd.collect()
         
-        # 检查是否需要压缩输出
         if output_path.endswith('.gz'):
-            # 输出为gzip压缩文件
             with gzip.open(output_path, 'wt') as f:
                 for result in results:
                     f.write(result + '\n')
         else:
-            # 输出为普通文本文件
             with open(output_path, 'w') as f:
                 for result in results:
                     f.write(result + '\n')
 
 def run_sampling_optimized(spark, input_file: str, output_file: str, number: int = 0, 
                           proportion: float = 0.0, seed: int = 11, format_type: str = 'auto',
-                          quiet: bool = False, use_preprocessing: bool = True):
-    """运行优化版本的采样任务"""
+                          quiet: bool = False, skip_count: bool = False, 
+                          async_count_enabled: bool = False):
+    """运行优化的采样任务"""
+    start_time = time.time()
+    
     if not quiet:
-        print("SeqSpark - 高性能分布式生物序列采样工具（优化版）")
+        print("SeqSpark - 高性能采样工具（无Count优化版）")
         print(f"输入文件: {input_file}")
         print(f"输出文件: {output_file}")
         
@@ -350,44 +271,66 @@ def run_sampling_optimized(spark, input_file: str, output_file: str, number: int
         
         print(f"随机种子: {seed}")
         print(f"格式: {format_type}")
-        print(f"压缩文件预处理: {'启用' if use_preprocessing else '禁用'}")
-    
-    start_time = time.time()
     
     # 读取序列
-    sequences_df = read_sequences_optimized(spark, input_file, format_type, use_preprocessing)
+    read_start = time.time()
+    sequences_df = read_sequences(spark, input_file, format_type)
+    read_time = time.time() - read_start
     
-    read_time = time.time() - start_time
-    if not quiet:
-        total_count = sequences_df.count()
-        print(f"总序列数: {total_count}")
-        print(f"读取耗时: {read_time:.2f}秒")
+    # 快速估算序列数量（可选）
+    estimated_total = None
+    if number > 0 and not skip_count:
+        estimated_total = estimate_sequence_count(input_file, format_type)
+        if not quiet:
+            print(f"估算序列数: ~{estimated_total:,}")
     
-    # 执行采样
-    sample_start_time = time.time()
+    # 可选的异步精确count
+    count_result = []
+    count_thread = None
+    if async_count_enabled and not skip_count:
+        if not quiet:
+            print("启动异步精确计数...")
+        count_thread = threading.Thread(target=async_count, args=(sequences_df, count_result))
+        count_thread.start()
     
+    # 执行采样（核心优化：不等待count完成）
+    sample_start = time.time()
     if number > 0:
-        sampled_df = sample_by_number(sequences_df, number, seed)
+        sampled_df = smart_sample_by_number(sequences_df, number, seed, estimated_total)
     else:
         sampled_df = sample_by_proportion(sequences_df, proportion, seed)
     
-    # 缓存结果以提高性能
+    # 缓存结果
     sampled_df.cache()
+    sample_time = time.time() - sample_start
     
-    sample_time = time.time() - sample_start_time
+    # 快速验证采样结果（仅对小数据集count）
     if not quiet:
-        sampled_count = sampled_df.count()
-        print(f"采样序列数: {sampled_count}")
-        print(f"采样耗时: {sample_time:.2f}秒")
+        verify_start = time.time()
+        sampled_count = sampled_df.count()  # 这个count很快，因为是采样后的小数据集
+        verify_time = time.time() - verify_start
+        print(f"实际采样数: {sampled_count:,}")
+        print(f"验证耗时: {verify_time:.2f}秒")
     
     # 写入结果
-    write_start_time = time.time()
+    write_start = time.time()
     write_sequences(sampled_df, output_file)
+    write_time = time.time() - write_start
     
-    write_time = time.time() - write_start_time
+    # 显示异步count结果（如果启用）
+    if count_thread:
+        if not quiet:
+            print("等待精确计数完成...")
+        count_thread.join()
+        if count_result and not quiet:
+            print(f"精确序列数: {count_result[0]:,}")
+    
     total_time = time.time() - start_time
     
     if not quiet:
+        print(f"\n性能统计:")
+        print(f"读取耗时: {read_time:.2f}秒")
+        print(f"采样耗时: {sample_time:.2f}秒")
         print(f"写入耗时: {write_time:.2f}秒")
         print(f"总耗时: {total_time:.2f}秒")
         print("采样完成！")
@@ -395,32 +338,29 @@ def run_sampling_optimized(spark, input_file: str, output_file: str, number: int
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description="SeqSpark - 高性能分布式生物序列采样工具（优化版）",
+        description="SeqSpark - 无Count优化版本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-优化版本特性:
-- 自动处理压缩文件的分区问题
-- 使用RDD重新分区技术
-- 支持Snappy压缩格式
-- 自动优化分区数量
-- 更好的性能监控
-
+优化特性:
+  --skip-count     完全跳过count操作（最快）
+  --async-count    异步执行精确count（平衡性能和信息）
+  
 示例用法:
-  # 优化处理大型压缩文件
-  python seqspark_sample_optimized.py -i large.fastq.gz -n 10000 -o sampled.fastq.gz
+  # 最快模式：跳过所有count
+  python seqspark_sample_no_count.py -i large.fastq.gz -n 10000 -o sampled.fastq.gz --skip-count
   
-  # 禁用预处理（直接处理压缩文件）
-  python seqspark_sample_optimized.py -i large.fastq.gz -n 10000 -o sampled.fastq.gz --no-preprocessing
+  # 平衡模式：异步count + 快速估算
+  python seqspark_sample_no_count.py -i large.fastq.gz -n 10000 -o sampled.fastq.gz --async-count
   
-  # 指定分区数量
-  python seqspark_sample_optimized.py -i large.fastq.gz -n 10000 -o sampled.fastq.gz --partitions 1000
+  # 静默快速模式
+  python seqspark_sample_no_count.py -i large.fastq.gz -n 10000 -o sampled.fastq.gz -q --skip-count
         """
     )
     
     parser.add_argument('-i', '--input', required=True,
-                       help='输入FASTA/FASTQ文件路径（支持.gz, .bz2, .xz压缩）')
+                       help='输入FASTA/FASTQ文件路径')
     parser.add_argument('-o', '--output', default='-',
-                       help='输出文件路径（默认：标准输出）。支持.gz压缩格式')
+                       help='输出文件路径（默认：标准输出）')
     parser.add_argument('-n', '--number', type=int, default=0,
                        help='按数量采样')
     parser.add_argument('-p', '--proportion', type=float, default=0.0,
@@ -435,10 +375,10 @@ def main():
                        help='Spark master URL（默认：local[*]）')
     parser.add_argument('--memory', default='4g',
                        help='Spark内存配置（默认：4g）')
-    parser.add_argument('--partitions', type=int, default=None,
-                       help='目标分区数量（默认：自动计算）')
-    parser.add_argument('--no-preprocessing', action='store_true',
-                       help='禁用压缩文件预处理')
+    parser.add_argument('--skip-count', action='store_true',
+                       help='跳过count操作以获得最大性能')
+    parser.add_argument('--async-count', action='store_true',
+                       help='异步执行精确count（平衡性能和信息）')
     
     args = parser.parse_args()
     
@@ -462,24 +402,21 @@ def main():
     # 创建Spark会话
     spark = SparkSession\
         .builder\
-        .appName("SeqSpark-Optimized")\
+        .appName("SeqSpark-NoCount")\
         .master(args.master)\
         .config("spark.driver.memory", args.memory)\
         .config("spark.executor.memory", args.memory)\
         .config("spark.sql.adaptive.enabled", "true")\
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")\
         .config("spark.sql.adaptive.skewJoin.enabled", "true")\
-        .config("spark.sql.shuffle.partitions", "200")\
+        .config("spark.sql.shuffle.partitions", "100")\
         .config("spark.sql.files.maxPartitionBytes", "134217728")\
-        .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")\
-        .config("spark.io.compression.codec", "snappy")\
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")\
         .getOrCreate()
     
-    # 设置日志级别
     spark.sparkContext.setLogLevel("WARN")
     
     try:
-        # 运行采样
         run_sampling_optimized(
             spark=spark,
             input_file=args.input,
@@ -489,7 +426,8 @@ def main():
             seed=args.seed,
             format_type=args.format,
             quiet=args.quiet,
-            use_preprocessing=not args.no_preprocessing
+            skip_count=args.skip_count,
+            async_count_enabled=args.async_count
         )
     finally:
         spark.stop()
